@@ -33,6 +33,9 @@ load_dotenv()
 
 # Configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./portfolio.db")
+# Some providers (Render/Heroku/Neon) hand out 'postgres://', which SQLAlchemy 2.x rejects.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 10080  # 7 days
