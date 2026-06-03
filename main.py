@@ -1,0 +1,1951 @@
+"""
+Alla Al Shami Portfolio - FastAPI Backend
+Full-stack portfolio management system with admin dashboard
+"""
+
+from fastapi import FastAPI, HTTPException, Depends, status, File, UploadFile, Request, BackgroundTasks
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, Float, func, text
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from pydantic import BaseModel, EmailStr, Field, field_validator
+from datetime import datetime, timedelta
+from typing import List, Optional
+from pathlib import Path
+import uuid
+import jwt
+import os
+import json
+import smtplib
+import ssl
+import httpx
+import asyncio
+import bcrypt
+import hmac
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from dotenv import load_dotenv
+import io
+
+# Load environment variables
+load_dotenv()
+
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./portfolio.db")
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 10080  # 7 days
+RATE_LIMITS = {
+    "login": (8, 15 * 60),
+    "contact": (5, 15 * 60),
+    "testimonial": (3, 60 * 60),
+    "reaction": (30, 60),
+    "video_view": (60, 60),
+    "delivery": (30, 60),
+    "review_comment": (20, 10 * 60),
+    "track": (30, 60),
+    "translate": (20, 10 * 60),
+}
+_rate_buckets = {}
+_translate_cache = {}
+
+# Create FastAPI app
+app = FastAPI(
+    title="Alla Al Shami Portfolio API",
+    description="Portfolio management system with admin dashboard",
+    version="1.0.0"
+)
+
+# Upload directory
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+# CORS configuration
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://allaportfolio.lensmania.ae",
+]
+# Add the production / future custom domain via EXTRA_ORIGINS (comma-separated) when migrating.
+extra = os.getenv("EXTRA_ORIGINS", "")
+if extra:
+    ALLOWED_ORIGINS += [o.strip() for o in extra.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Prevent browser/CDN caching of API responses so admin edits show up immediately
+@app.middleware("http")
+async def add_no_cache_headers(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+# Database setup
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
+    pool_pre_ping=True,
+    pool_recycle=300,
+)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# ==================== DATABASE MODELS ====================
+
+class User(Base):
+    __tablename__ = "users"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True)
+    password_hash = Column(String)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Category(Base):
+    __tablename__ = "categories"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True)  # Work, Events, Social Media, Food, Podcasts, YouTube
+    slug = Column(String, unique=True, index=True)
+    description = Column(Text, nullable=True)
+    order = Column(Integer, default=0)
+    thumbnail_url = Column(String, nullable=True)
+    cover_portfolio_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Portfolio(Base):
+    __tablename__ = "portfolios"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    category_id = Column(Integer, index=True)
+    title = Column(String, index=True)
+    description = Column(Text, nullable=True)
+    thumbnail_url = Column(String, nullable=True)
+    video_url = Column(String, nullable=True)
+    video_type = Column(String, default="youtube")
+    embed_code = Column(Text, nullable=True)
+    views = Column(Integer, default=0)
+    likes = Column(Integer, default=0)
+    reactions = Column(Text, nullable=True)
+    featured = Column(Boolean, default=False)
+    featured_focal_x = Column(Float, default=50.0)
+    featured_focal_y = Column(Float, default=50.0)
+    order = Column(Integer, default=0)
+    aspect_ratio = Column(String, default="16:9")
+    collaborators = Column(Text, nullable=True)
+    bts_photos = Column(Text, nullable=True)
+    seo_title = Column(String, nullable=True)
+    seo_description = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class About(Base):
+    __tablename__ = "about"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String)
+    bio = Column(Text)
+    image_url = Column(String, nullable=True)
+    skills = Column(Text)  # JSON string of skills
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class Settings(Base):
+    __tablename__ = "settings"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    site_title = Column(String, default="Alla Al Shami")
+    site_description = Column(Text)
+    email = Column(String)
+    phone = Column(String, nullable=True)
+    location = Column(String, default="Dubai, UAE")
+    instagram = Column(String, nullable=True)
+    youtube = Column(String, nullable=True)
+    linkedin = Column(String, nullable=True)
+    whatsapp = Column(String, nullable=True)
+    tiktok = Column(String, nullable=True)
+    snapchat = Column(String, nullable=True)
+    hero_image = Column(String, nullable=True)
+    showreel_url = Column(String, nullable=True)
+    about_text = Column(Text, nullable=True)
+    about_image = Column(String, nullable=True)
+    reel_of_month_id = Column(Integer, nullable=True)
+    ga_tracking_id = Column(String, nullable=True)
+    maintenance_mode = Column(Boolean, default=False)
+    site_title_ar = Column(String, nullable=True)
+    site_description_ar = Column(Text, nullable=True)
+    about_text_ar = Column(Text, nullable=True)
+    booking_enabled = Column(Boolean, default=True)
+    available_for_booking = Column(Boolean, default=True)
+    availability_text = Column(String, nullable=True)
+    color_primary = Column(String, nullable=True)
+    color_background = Column(String, nullable=True)
+    color_surface = Column(String, nullable=True)
+    color_text = Column(String, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class Testimonial(Base):
+    __tablename__ = "testimonials"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    role = Column(String, nullable=True)
+    text = Column(Text, nullable=False)
+    rating = Column(Integer, default=5)
+    photo_url = Column(String, nullable=True)
+    order = Column(Integer, default=0)
+    active = Column(Boolean, default=True)
+    approved = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class ClientLogo(Base):
+    __tablename__ = "client_logos"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)  # brand name shown in admin
+    image_url = Column(String, nullable=False)  # logo image URL
+    link_url = Column(String, nullable=True)  # optional brand site link
+    order = Column(Integer, default=0)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    id = Column(Integer, primary_key=True, index=True)
+    type = Column(String, nullable=False)
+    title = Column(String, nullable=False)
+    body = Column(Text, nullable=True)
+    read = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+class VideoView(Base):
+    __tablename__ = "video_views"
+    id = Column(Integer, primary_key=True, index=True)
+    portfolio_id = Column(Integer, index=True)
+    ip = Column(String, nullable=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+class ContactSubmission(Base):
+    __tablename__ = "contact_submissions"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String)
+    email = Column(String)
+    service = Column(String, nullable=True)
+    message = Column(Text)
+    source = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Visit(Base):
+    __tablename__ = "visits"
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    ip = Column(String, nullable=True)
+    country = Column(String, nullable=True)
+    city = Column(String, nullable=True)
+    user_agent = Column(String, nullable=True)
+    utm_source = Column(String, nullable=True)
+
+class ReviewSession(Base):
+    __tablename__ = "review_sessions"
+    id = Column(Integer, primary_key=True, index=True)
+    token = Column(String, unique=True, index=True)
+    portfolio_id = Column(Integer, index=True)
+    client_name = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=True)
+
+class ReviewComment(Base):
+    __tablename__ = "review_comments"
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, index=True)
+    timestamp_sec = Column(Float, default=0)
+    text = Column(Text)
+    author = Column(String, nullable=True)
+    resolved = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class ClientDelivery(Base):
+    __tablename__ = "client_deliveries"
+    id = Column(Integer, primary_key=True, index=True)
+    token = Column(String, unique=True, index=True)
+    client_name = Column(String, nullable=False)
+    project_title = Column(String, nullable=False)
+    message = Column(Text, nullable=True)
+    files = Column(Text, default='[]')  # JSON array
+    password = Column(String, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    download_count = Column(Integer, default=0)
+    last_accessed = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+# ==================== MIGRATIONS ====================
+def _run_migrations():
+    is_pg = 'postgresql' in DATABASE_URL
+    migrations = [
+        ("settings", "whatsapp", "VARCHAR"),
+        ("settings", "tiktok", "VARCHAR"),
+        ("settings", "snapchat", "VARCHAR"),
+        ("settings", "hero_image", "VARCHAR"),
+        ("settings", "showreel_url", "VARCHAR"),
+        ("settings", "about_text", "TEXT"),
+        ("settings", "about_image", "VARCHAR"),
+        ("settings", "reel_of_month_id", "INTEGER"),
+        ("settings", "ga_tracking_id", "VARCHAR"),
+        ("settings", "maintenance_mode", "BOOLEAN"),
+        ("settings", "site_title_ar", "VARCHAR"),
+        ("settings", "site_description_ar", "TEXT"),
+        ("settings", "about_text_ar", "TEXT"),
+        ("settings", "booking_enabled", "BOOLEAN"),
+        ("settings", "available_for_booking", "BOOLEAN"),
+        ("settings", "availability_text", "VARCHAR"),
+        ("settings", "color_primary", "VARCHAR"),
+        ("settings", "color_background", "VARCHAR"),
+        ("settings", "color_surface", "VARCHAR"),
+        ("settings", "color_text", "VARCHAR"),
+        ("contact_submissions", "source", "VARCHAR"),
+        ("visits", "utm_source", "VARCHAR"),
+        ("portfolios", "likes", "INTEGER"),
+        ("portfolios", "reactions", "TEXT"),
+        ("portfolios", "aspect_ratio", "VARCHAR"),
+        ("portfolios", "collaborators", "TEXT"),
+        ("portfolios", "bts_photos", "TEXT"),
+        ("portfolios", "seo_title", "VARCHAR"),
+        ("portfolios", "seo_description", "TEXT"),
+        ("portfolios", "featured_focal_x", "FLOAT"),
+        ("portfolios", "featured_focal_y", "FLOAT"),
+        ("testimonials", "approved", "BOOLEAN"),
+        ("categories", "thumbnail_url", "VARCHAR"),
+        ("categories", "cover_portfolio_id", "INTEGER"),
+    ]
+    with engine.connect() as conn:
+        for table, col, col_type in migrations:
+            try:
+                if is_pg:
+                    conn.execute(text(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "{col}" {col_type}'))
+                else:
+                    conn.execute(text(f'ALTER TABLE {table} ADD COLUMN "{col}" {col_type}'))
+            except Exception:
+                pass
+        try:
+            conn.commit()
+        except Exception:
+            pass
+
+_run_migrations()
+
+def _hash_secret(secret: str) -> str:
+    return bcrypt.hashpw(secret.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+def _is_bcrypt_hash(value: Optional[str]) -> bool:
+    return bool(value and value.startswith(("$2a$", "$2b$", "$2y$")))
+
+def _verify_secret(provided: str, stored: Optional[str]) -> bool:
+    if not stored:
+        return False
+    if _is_bcrypt_hash(stored):
+        try:
+            return bcrypt.checkpw(provided.encode("utf-8"), stored.encode("utf-8"))
+        except ValueError:
+            return False
+    # Backward compatible with existing plaintext admin/delivery passwords.
+    return hmac.compare_digest(provided, stored)
+
+def _prepare_optional_secret(secret: Optional[str]) -> Optional[str]:
+    if not secret:
+        return None
+    return _hash_secret(secret)
+
+# Seed admin user from .env on first run
+def _seed_admin():
+    db = SessionLocal()
+    try:
+        if not db.query(User).first():
+            admin_email = os.getenv("ADMIN_EMAIL", "admin@allaportfolio.lensmania.ae")
+            admin_password = os.getenv("ADMIN_PASSWORD", "change-this-password")
+            db.add(User(email=admin_email, password_hash=_hash_secret(admin_password)))
+            db.commit()
+    finally:
+        db.close()
+
+_seed_admin()
+
+# ==================== PYDANTIC SCHEMAS ====================
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=1, max_length=256)
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+    expires_in: int
+
+class CategoryCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    slug: str = Field(min_length=1, max_length=100)
+    description: Optional[str] = Field(default=None, max_length=500)
+    thumbnail_url: Optional[str] = Field(default=None, max_length=2000)
+    cover_portfolio_id: Optional[int] = None
+
+class CategoryResponse(BaseModel):
+    id: int
+    name: str
+    slug: str
+    description: Optional[str]
+    order: int
+    thumbnail_url: Optional[str] = None
+    cover_portfolio_id: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+class PortfolioCreate(BaseModel):
+    category_id: int
+    title: str = Field(min_length=1, max_length=180)
+    description: Optional[str] = Field(default=None, max_length=5000)
+    thumbnail_url: Optional[str] = Field(default=None, max_length=2000)
+    video_url: Optional[str] = Field(default=None, max_length=2000)
+    video_type: str = Field(default="youtube", max_length=40)
+    embed_code: Optional[str] = None
+    featured: bool = False
+    featured_focal_x: Optional[float] = 50.0
+    featured_focal_y: Optional[float] = 50.0
+    order: int = 0
+    aspect_ratio: str = Field(default="16:9", max_length=20)
+    collaborators: Optional[str] = Field(default=None, max_length=5000)
+    bts_photos: Optional[str] = Field(default=None, max_length=10000)
+    seo_title: Optional[str] = Field(default=None, max_length=180)
+    seo_description: Optional[str] = Field(default=None, max_length=500)
+
+class PortfolioUpdate(BaseModel):
+    category_id: Optional[int] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    video_url: Optional[str] = None
+    video_type: Optional[str] = None
+    embed_code: Optional[str] = None
+    featured: Optional[bool] = None
+    featured_focal_x: Optional[float] = None
+    featured_focal_y: Optional[float] = None
+    order: Optional[int] = None
+    aspect_ratio: Optional[str] = None
+    collaborators: Optional[str] = None
+    bts_photos: Optional[str] = None
+    seo_title: Optional[str] = None
+    seo_description: Optional[str] = None
+
+class PortfolioResponse(BaseModel):
+    id: int
+    category_id: int
+    title: str
+    description: Optional[str]
+    thumbnail_url: Optional[str]
+    video_url: Optional[str]
+    video_type: str
+    embed_code: Optional[str]
+    views: int
+    likes: int = 0
+    reactions: Optional[str]
+    featured: bool
+    featured_focal_x: Optional[float] = 50.0
+    featured_focal_y: Optional[float] = 50.0
+    order: int
+    aspect_ratio: str = "16:9"
+    collaborators: Optional[str]
+    bts_photos: Optional[str]
+    seo_title: Optional[str]
+    seo_description: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+    @field_validator("views", "likes", "order", mode="before")
+    @classmethod
+    def default_ints(cls, value):
+        return 0 if value is None else value
+
+    @field_validator("video_type", mode="before")
+    @classmethod
+    def default_video_type(cls, value):
+        return value or "youtube"
+
+    @field_validator("aspect_ratio", mode="before")
+    @classmethod
+    def default_aspect_ratio(cls, value):
+        return value or "16:9"
+
+    @field_validator("featured", mode="before")
+    @classmethod
+    def default_featured(cls, value):
+        return False if value is None else value
+
+    class Config:
+        from_attributes = True
+
+class TestimonialCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    role: Optional[str] = Field(default=None, max_length=160)
+    text: str = Field(min_length=2, max_length=2000)
+    rating: int = Field(default=5, ge=1, le=5)
+    photo_url: Optional[str] = Field(default=None, max_length=2000)
+    order: int = 0
+
+class TestimonialResponse(BaseModel):
+    id: int
+    name: str
+    role: Optional[str]
+    text: str
+    rating: int
+    photo_url: Optional[str]
+    order: int
+    active: bool
+    approved: bool = False
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+
+class CategoryReorderRequest(BaseModel):
+    ids: List[int]
+
+class AboutCreate(BaseModel):
+    title: str
+    bio: str
+    image_url: Optional[str] = None
+    skills: str  # JSON string
+
+class AboutResponse(BaseModel):
+    id: int
+    title: str
+    bio: str
+    image_url: Optional[str]
+    skills: str
+    updated_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+class SettingsResponse(BaseModel):
+    id: int
+    site_title: str
+    site_description: Optional[str]
+    email: Optional[str]
+    phone: Optional[str]
+    location: Optional[str]
+    instagram: Optional[str]
+    youtube: Optional[str]
+    linkedin: Optional[str]
+    whatsapp: Optional[str]
+    tiktok: Optional[str]
+    snapchat: Optional[str]
+    hero_image: Optional[str]
+    showreel_url: Optional[str]
+    about_text: Optional[str]
+    about_image: Optional[str]
+    reel_of_month_id: Optional[int]
+    ga_tracking_id: Optional[str]
+    maintenance_mode: bool = False
+    site_title_ar: Optional[str]
+    site_description_ar: Optional[str]
+    about_text_ar: Optional[str]
+    booking_enabled: bool = True
+    available_for_booking: bool = True
+    availability_text: Optional[str]
+    color_primary: Optional[str]
+    color_background: Optional[str]
+    color_surface: Optional[str]
+    color_text: Optional[str]
+
+    @field_validator("maintenance_mode", mode="before")
+    @classmethod
+    def default_maintenance_mode(cls, value):
+        return False if value is None else value
+
+    @field_validator("booking_enabled", "available_for_booking", mode="before")
+    @classmethod
+    def default_booking_flags(cls, value):
+        return True if value is None else value
+
+    class Config:
+        from_attributes = True
+
+class ReactRequest(BaseModel):
+    reaction: str
+
+class ContactRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    email: EmailStr
+    service: Optional[str] = None
+    message: str = Field(min_length=2, max_length=5000)
+    source: Optional[str] = Field(default=None, max_length=120)
+
+    @field_validator("service")
+    @classmethod
+    def trim_service(cls, value):
+        return value[:120] if value else value
+
+class NotificationResponse(BaseModel):
+    id: int
+    type: str
+    title: str
+    body: Optional[str]
+    read: bool
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+# ==================== DEPENDENCY INJECTION ====================
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+security = HTTPBearer()
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+def _rate_limit(request: Request, bucket: str):
+    limit, window = RATE_LIMITS[bucket]
+    now = datetime.utcnow().timestamp()
+    key = (bucket, _client_ip(request))
+    hits = [ts for ts in _rate_buckets.get(key, []) if now - ts < window]
+    if len(hits) >= limit:
+        raise HTTPException(status_code=429, detail="Too many requests. Please try again later.")
+    hits.append(now)
+    _rate_buckets[key] = hits
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication credentials",
+            )
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+        )
+    return email
+
+def _ensure_category_exists(category_id: int, db: Session):
+    exists = db.query(Category.id).filter(Category.id == category_id).first()
+    if not exists:
+        raise HTTPException(status_code=400, detail="Category does not exist")
+
+def _validate_category_cover(cover_portfolio_id: Optional[int], category_id: int, db: Session):
+    if cover_portfolio_id is None:
+        return
+    item = db.query(Portfolio).filter(Portfolio.id == cover_portfolio_id).first()
+    if not item:
+        raise HTTPException(status_code=400, detail="Cover video does not exist")
+    if item.category_id != category_id:
+        raise HTTPException(status_code=400, detail="Cover video must belong to this category")
+
+# ==================== AUTHENTICATION ROUTES ====================
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login(credentials: UserLogin, request: Request, db: Session = Depends(get_db)):
+    """Admin login endpoint"""
+    _rate_limit(request, "login")
+    user = db.query(User).filter(User.email == credentials.email).first()
+    
+    if not user or not _verify_secret(credentials.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials"
+        )
+
+    if not _is_bcrypt_hash(user.password_hash):
+        user.password_hash = _hash_secret(credentials.password)
+        db.commit()
+    
+    # Create JWT token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.utcnow() + access_token_expires
+    to_encode = {"sub": user.email, "exp": expire}
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    
+    return {
+        "access_token": encoded_jwt,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    }
+
+# ==================== CATEGORY ROUTES ====================
+
+@app.get("/api/categories", response_model=List[CategoryResponse])
+def get_categories(db: Session = Depends(get_db)):
+    """Get all portfolio categories"""
+    categories = db.query(Category).order_by(Category.order).all()
+    return categories
+
+@app.post("/api/categories", response_model=CategoryResponse)
+def create_category(
+    category: CategoryCreate,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Create new portfolio category (admin only)"""
+    if category.cover_portfolio_id is not None:
+        raise HTTPException(status_code=400, detail="Create the category before assigning a cover video")
+    max_order = db.query(func.max(Category.order)).scalar()
+    db_category = Category(
+        name=category.name,
+        slug=category.slug,
+        description=category.description,
+        order=(max_order + 1) if max_order is not None else 0,
+        thumbnail_url=category.thumbnail_url,
+        cover_portfolio_id=None
+    )
+    db.add(db_category)
+    db.commit()
+    db.refresh(db_category)
+    return db_category
+
+@app.put("/api/categories/reorder")
+def reorder_categories(data: CategoryReorderRequest, email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    for i, cat_id in enumerate(data.ids):
+        cat = db.query(Category).filter(Category.id == cat_id).first()
+        if cat: cat.order = i
+    db.commit()
+    return {"ok": True}
+
+@app.put("/api/categories/{cat_id}", response_model=CategoryResponse)
+def update_category(cat_id: int, category: CategoryCreate, email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    cat = db.query(Category).filter(Category.id == cat_id).first()
+    if not cat: raise HTTPException(404, "Not found")
+    _validate_category_cover(category.cover_portfolio_id, cat_id, db)
+    cat.name = category.name
+    cat.slug = category.slug
+    cat.description = category.description
+    cat.thumbnail_url = category.thumbnail_url
+    cat.cover_portfolio_id = category.cover_portfolio_id
+    db.commit(); db.refresh(cat)
+    return cat
+
+@app.delete("/api/categories/{cat_id}")
+def delete_category(cat_id: int, email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    cat = db.query(Category).filter(Category.id == cat_id).first()
+    if not cat: raise HTTPException(404, "Not found")
+    item_count = db.query(Portfolio).filter(Portfolio.category_id == cat_id).count()
+    if item_count:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete category with {item_count} portfolio item{'s' if item_count != 1 else ''}. Move or delete those items first."
+        )
+    db.delete(cat); db.commit()
+    return {"ok": True}
+
+# ==================== PORTFOLIO ROUTES ====================
+
+@app.get("/api/portfolio", response_model=List[PortfolioResponse])
+def get_portfolio(
+    category: Optional[str] = None,
+    featured: bool = False,
+    db: Session = Depends(get_db)
+):
+    """Get portfolio items, optionally filtered by category"""
+    query = db.query(Portfolio)
+    
+    if category:
+        cat = db.query(Category).filter(Category.slug == category).first()
+        if cat:
+            query = query.filter(Portfolio.category_id == cat.id)
+        else:
+            return []
+    
+    if featured:
+        query = query.filter(Portfolio.featured == True)
+    
+    items = query.order_by(Portfolio.order).all()
+    return items
+
+@app.get("/api/portfolio/{item_id}", response_model=PortfolioResponse)
+def get_portfolio_item(item_id: int, db: Session = Depends(get_db)):
+    """Get specific portfolio item"""
+    item = db.query(Portfolio).filter(Portfolio.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Portfolio item not found")
+    
+    # Increment view count
+    item.views += 1
+    db.commit()
+    return item
+
+@app.post("/api/portfolio", response_model=PortfolioResponse)
+def create_portfolio_item(
+    portfolio: PortfolioCreate,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Create new portfolio item (admin only)"""
+    _ensure_category_exists(portfolio.category_id, db)
+    db_portfolio = Portfolio(**portfolio.model_dump())
+    db.add(db_portfolio)
+    db.commit()
+    db.refresh(db_portfolio)
+    return db_portfolio
+
+@app.put("/api/portfolio/{item_id}", response_model=PortfolioResponse)
+def update_portfolio_item(
+    item_id: int,
+    portfolio: PortfolioUpdate,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Update portfolio item (admin only)"""
+    db_item = db.query(Portfolio).filter(Portfolio.id == item_id).first()
+    if not db_item:
+        raise HTTPException(status_code=404, detail="Portfolio item not found")
+    
+    update_data = portfolio.model_dump(exclude_unset=True)
+    old_category_id = db_item.category_id
+    if "category_id" in update_data and update_data["category_id"] is not None:
+        _ensure_category_exists(update_data["category_id"], db)
+    for field, value in update_data.items():
+        setattr(db_item, field, value)
+    if "category_id" in update_data and update_data["category_id"] != old_category_id:
+        db.query(Category).filter(
+            Category.cover_portfolio_id == item_id,
+            Category.id != db_item.category_id
+        ).update({Category.cover_portfolio_id: None}, synchronize_session=False)
+    
+    db_item.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(db_item)
+    return db_item
+
+@app.delete("/api/portfolio/{item_id}")
+def delete_portfolio_item(
+    item_id: int,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Delete portfolio item (admin only)"""
+    db_item = db.query(Portfolio).filter(Portfolio.id == item_id).first()
+    if not db_item:
+        raise HTTPException(status_code=404, detail="Portfolio item not found")
+    
+    db.query(Category).filter(Category.cover_portfolio_id == item_id).update(
+        {Category.cover_portfolio_id: None},
+        synchronize_session=False
+    )
+    db.delete(db_item)
+    db.commit()
+    return {"message": "Portfolio item deleted"}
+
+# ==================== ABOUT ROUTES ====================
+
+@app.get("/api/about", response_model=AboutResponse)
+def get_about(db: Session = Depends(get_db)):
+    """Get about section content"""
+    about = db.query(About).first()
+    if not about:
+        raise HTTPException(status_code=404, detail="About section not found")
+    return about
+
+@app.put("/api/about", response_model=AboutResponse)
+def update_about(
+    about_data: AboutCreate,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Update about section (admin only)"""
+    about = db.query(About).first()
+    if not about:
+        about = About(**about_data.model_dump())
+        db.add(about)
+    else:
+        for field, value in about_data.model_dump().items():
+            setattr(about, field, value)
+    
+    db.commit()
+    db.refresh(about)
+    return about
+
+# ==================== SETTINGS ROUTES ====================
+
+@app.get("/api/settings", response_model=SettingsResponse)
+def get_settings(db: Session = Depends(get_db)):
+    """Get site settings"""
+    settings = db.query(Settings).first()
+    if not settings:
+        settings = Settings(
+            site_title=os.getenv("SITE_TITLE", "Alla Al Shami"),
+            site_description=os.getenv("SITE_DESCRIPTION", "Professional Photographer based in Dubai, UAE"),
+            email=os.getenv("CONTACT_EMAIL", os.getenv("ADMIN_EMAIL", ""))
+        )
+        db.add(settings)
+        db.commit()
+        db.refresh(settings)
+    return settings
+
+@app.put("/api/settings", response_model=SettingsResponse)
+def update_settings(
+    settings_data: SettingsResponse,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Update site settings (admin only)"""
+    settings = db.query(Settings).first()
+    if not settings:
+        settings = Settings(**settings_data.model_dump())
+        db.add(settings)
+    else:
+        for field, value in settings_data.model_dump(exclude={"id"}).items():
+            setattr(settings, field, value)
+    
+    db.commit()
+    db.refresh(settings)
+    return settings
+
+# ==================== FILE UPLOAD ====================
+
+ALLOWED_EXTENSIONS = {
+    '.mp4', '.mov', '.avi', '.mkv', '.webm',
+    '.jpg', '.jpeg', '.png', '.gif', '.webp',
+    '.svg', '.heic', '.heif',
+}
+
+GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+
+def _google_drive_configured() -> bool:
+    return bool(
+        os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+        and (os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON") or os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE"))
+    )
+
+def _google_drive_credentials_info():
+    service_account_json = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON")
+    if service_account_json:
+        try:
+            return json.loads(service_account_json)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON is not valid JSON") from exc
+
+    service_account_file = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE")
+    if service_account_file:
+        with open(service_account_file, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+
+    raise RuntimeError("Google Drive credentials are not configured")
+
+def _google_drive_upload(file_bytes: bytes, filename: str, content_type: str):
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload
+
+    folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+    credentials = service_account.Credentials.from_service_account_info(
+        _google_drive_credentials_info(),
+        scopes=GOOGLE_DRIVE_SCOPES,
+    )
+    service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=content_type, resumable=True)
+    metadata = {"name": filename, "parents": [folder_id]}
+
+    created = service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id,name,webViewLink,webContentLink",
+        supportsAllDrives=True,
+    ).execute()
+
+    if os.getenv("GOOGLE_DRIVE_PUBLIC", "true").lower() in {"1", "true", "yes"}:
+        service.permissions().create(
+            fileId=created["id"],
+            body={"role": "reader", "type": "anyone"},
+            supportsAllDrives=True,
+        ).execute()
+
+    file_id = created["id"]
+    return {
+        "url": f"https://drive.google.com/uc?export=download&id={file_id}",
+        "filename": filename,
+        "drive_file_id": file_id,
+        "webViewLink": created.get("webViewLink"),
+        "webContentLink": created.get("webContentLink"),
+    }
+
+@app.post("/api/upload-signature")
+def get_upload_signature(email: str = Depends(verify_token)):
+    """Return signed Cloudinary upload params for direct browser upload (supports large files)."""
+    import cloudinary
+    import cloudinary.utils
+    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME")
+    api_key = os.getenv("CLOUDINARY_API_KEY")
+    api_secret = os.getenv("CLOUDINARY_API_SECRET")
+    if not all([cloud_name, api_key, api_secret]):
+        raise HTTPException(status_code=503, detail="Cloudinary not configured.")
+    cloudinary.config(cloud_name=cloud_name, api_key=api_key, api_secret=api_secret, secure=True)
+    timestamp = int(datetime.utcnow().timestamp())
+    folder = os.getenv("CLOUDINARY_FOLDER", "alla-portfolio")
+    public_id = str(uuid.uuid4())
+    params = {"folder": folder, "public_id": public_id, "timestamp": timestamp}
+    signature = cloudinary.utils.api_sign_request(params, api_secret)
+    return {
+        "cloud_name": cloud_name,
+        "api_key": api_key,
+        "timestamp": timestamp,
+        "folder": folder,
+        "public_id": public_id,
+        "signature": signature,
+    }
+
+def _cloudinary_upload(file_bytes: bytes, resource_type: str = "auto"):
+    import cloudinary
+    import cloudinary.uploader
+    cloudinary.config(
+        cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+        api_key=os.getenv("CLOUDINARY_API_KEY"),
+        api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+        secure=True
+    )
+    result = cloudinary.uploader.upload(
+        io.BytesIO(file_bytes),
+        resource_type=resource_type,
+        folder=os.getenv("CLOUDINARY_FOLDER", "alla-portfolio"),
+        public_id=str(uuid.uuid4()),
+        chunk_size=6000000,
+        timeout=120
+    )
+    return result["secure_url"]
+
+@app.post("/api/upload")
+async def upload_file(
+    request: Request,
+    file: UploadFile = File(...),
+    email: str = Depends(verify_token),
+):
+    try:
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="File has no name")
+
+        ext = Path(file.filename).suffix.lower()
+        if not ext:
+            raise HTTPException(status_code=400, detail="File has no extension")
+
+        if ext not in ALLOWED_EXTENSIONS:
+            allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
+            raise HTTPException(status_code=400, detail=f"File type '{ext}' not allowed. Allowed types: {allowed}")
+
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="File is empty")
+
+        requested_provider = (request.query_params.get("provider") or "").lower()
+        wants_google_drive = requested_provider in {"gdrive", "google", "google-drive"}
+
+        if _google_drive_configured():
+            try:
+                content_type = file.content_type or "application/octet-stream"
+                return await asyncio.to_thread(_google_drive_upload, file_bytes, file.filename, content_type)
+            except Exception as e:
+                error_msg = str(e)
+                print(f"[Google Drive error] {error_msg}")
+                raise HTTPException(status_code=500, detail=f"Google Drive upload failed: {error_msg}")
+        if wants_google_drive:
+            raise HTTPException(
+                status_code=503,
+                detail="Google Drive upload is not configured. Add GOOGLE_DRIVE_FOLDER_ID and GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON.",
+            )
+
+        use_cloudinary = os.getenv("CLOUDINARY_CLOUD_NAME")
+
+        if use_cloudinary:
+            is_video = ext in {'.mp4', '.mov', '.avi', '.mkv', '.webm'}
+            resource_type = "video" if is_video else "image"
+            try:
+                url = await asyncio.to_thread(_cloudinary_upload, file_bytes, resource_type)
+                return {"url": url, "filename": file.filename}
+            except Exception as e:
+                error_msg = str(e)
+                print(f"[Cloudinary error] {error_msg}")
+                raise HTTPException(status_code=500, detail=f"Cloudinary upload failed: {error_msg}")
+
+        # Fallback: local storage
+        filename = f"{uuid.uuid4()}{ext}"
+        dest = UPLOAD_DIR / filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("wb") as buf:
+            buf.write(file_bytes)
+        return {"url": f"/uploads/{filename}", "filename": filename}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = str(e)
+        print(f"[Upload error] {error_msg}")
+        raise HTTPException(status_code=500, detail=f"Upload processing failed: {error_msg}")
+
+# ==================== ANALYTICS & TRACKING ====================
+
+async def _get_location(ip: str):
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(f"https://ipapi.co/{ip}/json/")
+            d = r.json()
+            return d.get("country_name"), d.get("city")
+    except Exception:
+        return None, None
+
+async def _send_visit_email(ip: str, country: str, city: str, ua: str, ts: datetime):
+    host = os.getenv("SMTP_HOST", "smtp.hostinger.com")
+    user = os.getenv("SMTP_USER", "")
+    pwd  = os.getenv("SMTP_PASS", "")
+    to   = os.getenv("NOTIFY_EMAIL", os.getenv("ADMIN_EMAIL", ""))
+    if not all([user, pwd, to]):
+        print(f"[Email] Missing config — user={bool(user)} pwd={bool(pwd)} to={bool(to)}")
+        return
+    msg = MIMEMultipart()
+    msg["From"] = user
+    msg["To"] = to
+    msg["Subject"] = f"New Portfolio Visit — {city or 'Unknown'}, {country or 'Unknown'}"
+    body = (
+        f"New visitor on allaportfolio.lensmania.ae\n\n"
+        f"Time:     {ts.strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"Location: {city or 'Unknown'}, {country or 'Unknown'}\n"
+        f"IP:       {ip}\n"
+        f"Device:   {ua[:120] if ua else 'Unknown'}\n"
+    )
+    msg.attach(MIMEText(body, "plain"))
+    def _send():
+        # Try port 587 STARTTLS first (most common for Hostinger)
+        try:
+            with smtplib.SMTP(host, 587, timeout=10) as s:
+                s.ehlo()
+                s.starttls(context=ssl.create_default_context())
+                s.login(user, pwd)
+                s.send_message(msg)
+                print(f"[Email] Sent via 587 STARTTLS to {to}")
+                return
+        except Exception as e1:
+            print(f"[Email] Port 587 failed: {e1}")
+        # Fallback: port 465 SSL
+        try:
+            with smtplib.SMTP_SSL(host, 465, context=ssl.create_default_context(), timeout=10) as s:
+                s.login(user, pwd)
+                s.send_message(msg)
+                print(f"[Email] Sent via 465 SSL to {to}")
+        except Exception as e2:
+            print(f"[Email] Port 465 failed: {e2}")
+    try:
+        await asyncio.to_thread(_send)
+    except Exception as e:
+        print(f"[Email] Thread error: {e}")
+
+async def _enrich_visit(visit_id: int, ip: str, ua: str, ts: datetime):
+    country, city = await _get_location(ip)
+    db = SessionLocal()
+    try:
+        v = db.query(Visit).filter(Visit.id == visit_id).first()
+        if v:
+            v.country = country
+            v.city = city
+            db.commit()
+    finally:
+        db.close()
+    if os.getenv("VISIT_NOTIFICATIONS", "false").lower() == "true":
+        db2 = SessionLocal()
+        try:
+            one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+            recent_count = db2.query(Visit).filter(Visit.ip == ip, Visit.timestamp >= one_hour_ago).count()
+        finally:
+            db2.close()
+        if recent_count <= 1:
+            await _send_visit_email(ip, country, city, ua, ts)
+
+class TrackRequest(BaseModel):
+    utm_source: Optional[str] = None
+
+@app.post("/api/track")
+async def track_visit(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    _rate_limit(request, "track")
+    ip = _client_ip(request)
+    ua = request.headers.get("User-Agent", "")[:200]
+    try:
+        body = await request.json()
+        utm = body.get("utm_source")
+    except: utm = None
+    visit = Visit(ip=ip, user_agent=ua, utm_source=utm)
+    db.add(visit); db.commit(); db.refresh(visit)
+    background_tasks.add_task(_enrich_visit, visit.id, ip, ua, visit.timestamp)
+    return {"ok": True}
+
+@app.get("/api/analytics")
+def get_analytics(email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    total = db.query(Visit).count()
+    recent = db.query(Visit).order_by(Visit.timestamp.desc()).limit(50).all()
+    by_country = (
+        db.query(Visit.country, func.count(Visit.id).label("count"))
+        .group_by(Visit.country)
+        .order_by(func.count(Visit.id).desc())
+        .limit(15).all()
+    )
+    thirty_ago = datetime.utcnow() - timedelta(days=30)
+    by_day = (
+        db.query(func.date(Visit.timestamp).label("date"), func.count(Visit.id).label("count"))
+        .filter(Visit.timestamp >= thirty_ago)
+        .group_by(func.date(Visit.timestamp))
+        .order_by(func.date(Visit.timestamp))
+        .all()
+    )
+    return {
+        "total": total,
+        "recent": [{"id": v.id, "timestamp": str(v.timestamp)[:16], "ip": v.ip, "country": v.country or "Unknown", "city": v.city or "Unknown", "ua": (v.user_agent or "")[:60]} for v in recent],
+        "by_country": [{"country": c.country or "Unknown", "count": c.count} for c in by_country],
+        "by_day": [{"date": str(d.date), "count": d.count} for d in by_day],
+    }
+
+# ==================== TESTIMONIALS ====================
+
+@app.get("/api/testimonials", response_model=List[TestimonialResponse])
+def get_testimonials(db: Session = Depends(get_db)):
+    return db.query(Testimonial).filter(Testimonial.active == True, Testimonial.approved == True).order_by(Testimonial.order).all()
+
+@app.get("/api/testimonials/all", response_model=List[TestimonialResponse])
+def get_all_testimonials(email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    return db.query(Testimonial).order_by(Testimonial.created_at.desc()).all()
+
+@app.post("/api/testimonials/submit")
+def submit_testimonial_public(t: TestimonialCreate, request: Request, db: Session = Depends(get_db)):
+    _rate_limit(request, "testimonial")
+    item = Testimonial(**t.model_dump(), approved=False, active=True)
+    db.add(item); db.commit(); db.refresh(item)
+    try:
+        notif = Notification(type="contact", title=f"⭐ New review from {t.name} — awaiting approval")
+        db.add(notif); db.commit()
+    except: pass
+    return {"ok": True, "message": "Thank you! Your review is pending approval."}
+
+@app.post("/api/testimonials", response_model=TestimonialResponse)
+def create_testimonial(t: TestimonialCreate, email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    item = Testimonial(**t.model_dump(), approved=True)
+    db.add(item); db.commit(); db.refresh(item)
+    return item
+
+@app.put("/api/testimonials/{tid}/approve")
+def approve_testimonial(tid: int, email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    item = db.query(Testimonial).filter(Testimonial.id == tid).first()
+    if not item: raise HTTPException(404, "Not found")
+    item.approved = not item.approved
+    db.commit()
+    return {"approved": item.approved}
+
+@app.put("/api/testimonials/{tid}/toggle-active")
+def toggle_testimonial(tid: int, email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    item = db.query(Testimonial).filter(Testimonial.id == tid).first()
+    if not item: raise HTTPException(404, "Not found")
+    item.active = not item.active
+    db.commit()
+    return {"active": item.active}
+
+@app.put("/api/testimonials/{tid}", response_model=TestimonialResponse)
+def update_testimonial(tid: int, t: TestimonialCreate, email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    item = db.query(Testimonial).filter(Testimonial.id == tid).first()
+    if not item: raise HTTPException(404, "Not found")
+    for k, v in t.model_dump().items(): setattr(item, k, v)
+    db.commit(); db.refresh(item)
+    return item
+
+@app.delete("/api/testimonials/{tid}")
+def delete_testimonial(tid: int, email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    item = db.query(Testimonial).filter(Testimonial.id == tid).first()
+    if not item: raise HTTPException(404, "Not found")
+    db.delete(item); db.commit()
+    return {"ok": True}
+
+# ==================== CLIENT LOGOS ====================
+
+@app.get("/api/client-logos")
+def list_client_logos(db: Session = Depends(get_db)):
+    rows = db.query(ClientLogo).filter(ClientLogo.active == True).order_by(ClientLogo.order, ClientLogo.id).all()
+    return [{"id": r.id, "name": r.name, "image_url": r.image_url, "link_url": r.link_url, "order": r.order, "active": r.active} for r in rows]
+
+@app.get("/api/client-logos/all")
+def list_all_client_logos(email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    rows = db.query(ClientLogo).order_by(ClientLogo.order, ClientLogo.id).all()
+    return [{"id": r.id, "name": r.name, "image_url": r.image_url, "link_url": r.link_url, "order": r.order, "active": r.active} for r in rows]
+
+class ClientLogoCreate(BaseModel):
+    name: str
+    image_url: str
+    link_url: Optional[str] = None
+    order: int = 0
+    active: bool = True
+
+@app.post("/api/client-logos")
+def create_client_logo(data: ClientLogoCreate, email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    item = ClientLogo(**data.dict())
+    db.add(item); db.commit(); db.refresh(item)
+    return {"id": item.id, "name": item.name, "image_url": item.image_url, "link_url": item.link_url, "order": item.order, "active": item.active}
+
+@app.put("/api/client-logos/{lid}")
+def update_client_logo(lid: int, data: ClientLogoCreate, email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    item = db.query(ClientLogo).filter(ClientLogo.id == lid).first()
+    if not item: raise HTTPException(404, "Not found")
+    for k, v in data.dict().items(): setattr(item, k, v)
+    db.commit(); db.refresh(item)
+    return {"id": item.id, "name": item.name, "image_url": item.image_url, "link_url": item.link_url, "order": item.order, "active": item.active}
+
+@app.delete("/api/client-logos/{lid}")
+def delete_client_logo(lid: int, email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    item = db.query(ClientLogo).filter(ClientLogo.id == lid).first()
+    if not item: raise HTTPException(404, "Not found")
+    db.delete(item); db.commit()
+    return {"ok": True}
+
+class ClientLogoReorder(BaseModel):
+    ids: List[int]
+
+@app.put("/api/client-logos/reorder")
+def reorder_client_logos(data: ClientLogoReorder, email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    for idx, lid in enumerate(data.ids):
+        item = db.query(ClientLogo).filter(ClientLogo.id == lid).first()
+        if item: item.order = idx
+    db.commit()
+    return {"ok": True}
+
+# ==================== LIKES ====================
+
+@app.post("/api/portfolio/{item_id}/like")
+def like_portfolio(item_id: int, request: Request, db: Session = Depends(get_db)):
+    _rate_limit(request, "reaction")
+    item = db.query(Portfolio).filter(Portfolio.id == item_id).first()
+    if not item: raise HTTPException(404, "Not found")
+    item.likes = (item.likes or 0) + 1
+    db.commit()
+    try:
+        notif = Notification(type="like", title=f"❤️ New like on \"{item.title}\"")
+        db.add(notif); db.commit()
+    except: pass
+    return {"likes": item.likes}
+
+# ==================== DUPLICATE ====================
+
+@app.post("/api/portfolio/{item_id}/duplicate", response_model=PortfolioResponse)
+def duplicate_portfolio(item_id: int, email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    item = db.query(Portfolio).filter(Portfolio.id == item_id).first()
+    if not item: raise HTTPException(404, "Not found")
+    new_item = Portfolio(
+        category_id=item.category_id, title=f"{item.title} (Copy)",
+        description=item.description, thumbnail_url=item.thumbnail_url,
+        video_url=item.video_url, video_type=item.video_type,
+        embed_code=item.embed_code, featured=False, order=item.order,
+        aspect_ratio=item.aspect_ratio, collaborators=item.collaborators,
+        bts_photos=item.bts_photos, seo_title=item.seo_title,
+        seo_description=item.seo_description
+    )
+    db.add(new_item); db.commit(); db.refresh(new_item)
+    return new_item
+
+# ==================== CHANGE PASSWORD ====================
+
+@app.put("/api/auth/change-password")
+def change_password(data: ChangePasswordRequest, email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == email).first()
+    if not user or not _verify_secret(data.current_password, user.password_hash):
+        raise HTTPException(400, "Current password is incorrect")
+    user.password_hash = _hash_secret(data.new_password)
+    db.commit()
+    return {"ok": True}
+
+# ==================== DATA EXPORT ====================
+
+@app.get("/api/export")
+def export_data(email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    import json
+    portfolio = db.query(Portfolio).all()
+    categories = db.query(Category).all()
+    testimonials = db.query(Testimonial).all()
+    settings = db.query(Settings).first()
+    return {
+        "exported_at": str(datetime.utcnow()),
+        "settings": {c.name: getattr(settings, c.name) for c in Settings.__table__.columns} if settings else {},
+        "categories": [{"id": c.id, "name": c.name, "slug": c.slug} for c in categories],
+        "portfolio": [{"id": p.id, "title": p.title, "video_url": p.video_url, "views": p.views, "likes": p.likes} for p in portfolio],
+        "testimonials": [{"name": t.name, "role": t.role, "text": t.text, "rating": t.rating} for t in testimonials],
+    }
+
+# ==================== REACTIONS ====================
+
+import json as _json
+
+@app.post("/api/portfolio/{item_id}/react")
+def react_portfolio(item_id: int, req: ReactRequest, request: Request, db: Session = Depends(get_db)):
+    _rate_limit(request, "reaction")
+    item = db.query(Portfolio).filter(Portfolio.id == item_id).first()
+    if not item: raise HTTPException(404, "Not found")
+    valid = {"heart", "fire", "clap", "wow"}
+    if req.reaction not in valid: raise HTTPException(400, "Invalid reaction")
+    r = _json.loads(item.reactions or '{"heart":0,"fire":0,"clap":0,"wow":0}')
+    r[req.reaction] = r.get(req.reaction, 0) + 1
+    item.reactions = _json.dumps(r)
+    db.commit()
+    # Create notification
+    try:
+        notif = Notification(type="reaction", title=f"New {req.reaction} reaction on \"{item.title}\"")
+        db.add(notif); db.commit()
+    except: pass
+    return r
+
+# ==================== VIDEO VIEW TRACKING ====================
+
+@app.post("/api/portfolio/{item_id}/view-track")
+async def track_video_view(item_id: int, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    _rate_limit(request, "video_view")
+    item = db.query(Portfolio).filter(Portfolio.id == item_id).first()
+    if not item: raise HTTPException(404, "Not found")
+    ip = _client_ip(request)
+    view = VideoView(portfolio_id=item_id, ip=ip)
+    db.add(view); db.commit()
+    one_hour_ago = datetime.utcnow() - timedelta(hours=24)
+    count = db.query(VideoView).filter(VideoView.portfolio_id == item_id, VideoView.ip == ip, VideoView.timestamp >= one_hour_ago).count()
+    if count >= 3:
+        title = item.title if item else f"Video #{item_id}"
+        existing = db.query(Notification).filter(Notification.type == "interested", Notification.title.contains(title)).order_by(Notification.created_at.desc()).first()
+        if not existing or (datetime.utcnow() - existing.created_at).seconds > 3600:
+            notif = Notification(type="interested", title=f"🔥 Hot lead! Someone watched \"{title}\" {count} times", body=f"IP: {ip}")
+            db.add(notif); db.commit()
+            background_tasks.add_task(_send_interested_email, title, count, ip)
+    return {"ok": True}
+
+async def _send_interested_email(title: str, count: int, ip: str):
+    host = os.getenv("SMTP_HOST", "smtp.hostinger.com")
+    user = os.getenv("SMTP_USER", ""); pwd = os.getenv("SMTP_PASS", "")
+    to = os.getenv("NOTIFY_EMAIL", os.getenv("ADMIN_EMAIL", ""))
+    if not all([user, pwd, to]): return
+    msg = MIMEMultipart()
+    msg["From"] = user; msg["To"] = to
+    msg["Subject"] = f"🔥 Hot Lead — Someone watched \"{title}\" {count} times!"
+    msg.attach(MIMEText(f"A potential client has viewed \"{title}\" {count} times in the last 24 hours.\n\nIP: {ip}\n\nConsider reaching out!", "plain"))
+    def _send():
+        try:
+            with smtplib.SMTP(host, 587, timeout=10) as s:
+                s.ehlo(); s.starttls(context=ssl.create_default_context()); s.login(user, pwd); s.send_message(msg)
+        except Exception as e: print(f"[Email] {e}")
+    try: await asyncio.to_thread(_send)
+    except: pass
+
+# ==================== CONTACT FORM ====================
+
+@app.post("/api/contact")
+async def submit_contact(data: ContactRequest, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    _rate_limit(request, "contact")
+    submission = ContactSubmission(name=data.name, email=data.email, service=data.service, message=data.message, source=data.source)
+    db.add(submission); db.commit()
+    notif = Notification(type="contact", title=f"📩 New inquiry from {data.name}", body=f"Service: {data.service or 'Not specified'}\n{data.message[:100]}")
+    db.add(notif); db.commit()
+    background_tasks.add_task(_send_contact_email, data)
+    return {"ok": True}
+
+async def _send_contact_email(data: ContactRequest):
+    host = os.getenv("SMTP_HOST", "smtp.hostinger.com")
+    user = os.getenv("SMTP_USER", ""); pwd = os.getenv("SMTP_PASS", "")
+    to = os.getenv("NOTIFY_EMAIL", os.getenv("ADMIN_EMAIL", ""))
+    if not all([user, pwd, to]): return
+    msg = MIMEMultipart()
+    msg["From"] = user; msg["To"] = to
+    msg["Subject"] = f"📩 New Portfolio Inquiry from {data.name}"
+    msg.attach(MIMEText(f"Name: {data.name}\nEmail: {data.email}\nService: {data.service or 'Not specified'}\n\n{data.message}", "plain"))
+    def _send():
+        try:
+            with smtplib.SMTP(host, 587, timeout=10) as s:
+                s.ehlo(); s.starttls(context=ssl.create_default_context()); s.login(user, pwd); s.send_message(msg)
+        except Exception as e: print(f"[Email] {e}")
+    try: await asyncio.to_thread(_send)
+    except: pass
+
+# ==================== NOTIFICATIONS ====================
+
+@app.get("/api/notifications", response_model=List[NotificationResponse])
+def get_notifications(email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    return db.query(Notification).order_by(Notification.created_at.desc()).limit(50).all()
+
+@app.get("/api/notifications/unread-count")
+def get_unread_count(email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    count = db.query(Notification).filter(Notification.read == False).count()
+    return {"count": count}
+
+@app.put("/api/notifications/read-all")
+def mark_all_read(email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    db.query(Notification).filter(Notification.read == False).update({"read": True})
+    db.commit()
+    return {"ok": True}
+
+@app.delete("/api/notifications/{nid}")
+def delete_notification(nid: int, email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    n = db.query(Notification).filter(Notification.id == nid).first()
+    if n: db.delete(n); db.commit()
+    return {"ok": True}
+
+# ==================== AUTO THUMBNAIL FETCH ====================
+
+class ThumbnailRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2000)
+
+def _scrape_og(html: str) -> dict:
+    """Extract og:title, og:description, og:image from raw HTML."""
+    import re as _re
+    result = {}
+    for prop in ('title', 'description', 'image'):
+        m = _re.search(rf'<meta[^>]+property=["\']og:{prop}["\'][^>]+content=["\']([^"\']+)["\']', html)
+        if not m:
+            m = _re.search(rf'content=["\']([^"\']+)["\'][^>]+property=["\']og:{prop}["\']', html)
+        if m:
+            result[prop] = m.group(1).strip()
+    return result
+
+@app.post("/api/fetch-thumbnail")
+async def fetch_thumbnail(data: ThumbnailRequest, email: str = Depends(verify_token)):
+    url = data.url.strip()
+
+    # YouTube
+    import re
+    yt = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})', url)
+    if yt:
+        vid = yt.group(1)
+        # Scrape og meta for title/description
+        meta = {}
+        try:
+            async with httpx.AsyncClient(timeout=6, headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True) as c:
+                r = await c.get(url)
+                meta = _scrape_og(r.text)
+        except: pass
+        for quality in ['maxresdefault', 'hqdefault', 'mqdefault']:
+            thumb = f"https://img.youtube.com/vi/{vid}/{quality}.jpg"
+            try:
+                async with httpx.AsyncClient(timeout=5) as c:
+                    r = await c.head(thumb)
+                    if r.status_code == 200:
+                        return {"thumbnail_url": thumb, "platform": "youtube", **meta}
+            except: pass
+        return {"thumbnail_url": f"https://img.youtube.com/vi/{vid}/hqdefault.jpg", "platform": "youtube", **meta}
+
+    # Vimeo
+    if 'vimeo.com' in url:
+        try:
+            async with httpx.AsyncClient(timeout=8) as c:
+                r = await c.get(f"https://vimeo.com/api/oembed.json?url={url}&width=1280")
+                d = r.json()
+                if d.get('thumbnail_url'):
+                    return {"thumbnail_url": d['thumbnail_url'], "platform": "vimeo",
+                            "title": d.get('title', ''), "description": d.get('description', '')}
+        except: pass
+
+    # TikTok
+    if 'tiktok.com' in url:
+        try:
+            async with httpx.AsyncClient(timeout=8, headers={"User-Agent": "Mozilla/5.0"}) as c:
+                r = await c.get(f"https://www.tiktok.com/oembed?url={url}")
+                d = r.json()
+                if d.get('thumbnail_url'):
+                    return {"thumbnail_url": d['thumbnail_url'], "platform": "tiktok",
+                            "title": d.get('title', ''), "description": ""}
+        except: pass
+
+    # Dailymotion
+    if 'dailymotion.com' in url:
+        dm = re.search(r'video/([a-z0-9]+)', url, re.I)
+        if dm:
+            try:
+                async with httpx.AsyncClient(timeout=8) as c:
+                    r = await c.get(f"https://api.dailymotion.com/video/{dm.group(1)}?fields=thumbnail_1080_url,thumbnail_url,title,description")
+                    d = r.json()
+                    thumb = d.get('thumbnail_1080_url') or d.get('thumbnail_url')
+                    if thumb:
+                        return {"thumbnail_url": thumb, "platform": "dailymotion",
+                                "title": d.get('title', ''), "description": d.get('description', '')}
+            except: pass
+
+    # Twitter/X
+    if 'twitter.com' in url or 'x.com' in url:
+        try:
+            async with httpx.AsyncClient(timeout=8, headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True) as c:
+                r = await c.get(url)
+                meta = _scrape_og(r.text)
+                if meta:
+                    return {"thumbnail_url": meta.get('image'), "platform": "twitter", **meta}
+        except: pass
+
+    # Instagram — try og scrape
+    if 'instagram.com' in url:
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'}
+            async with httpx.AsyncClient(timeout=8, headers=headers, follow_redirects=True) as c:
+                r = await c.get(url)
+                meta = _scrape_og(r.text)
+                if meta.get('image'):
+                    return {"thumbnail_url": meta['image'], "platform": "instagram",
+                            "title": meta.get('title', ''), "description": meta.get('description', '')}
+        except: pass
+        return {"thumbnail_url": None, "platform": "instagram", "manual": True}
+
+    # Generic og scrape fallback
+    try:
+        async with httpx.AsyncClient(timeout=8, headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True) as c:
+            r = await c.get(url)
+            meta = _scrape_og(r.text)
+            if meta:
+                return {"thumbnail_url": meta.get('image'), "platform": "unknown", **meta}
+    except: pass
+
+    return {"thumbnail_url": None, "platform": "unknown"}
+
+# ==================== AI ENDPOINTS ====================
+
+def _get_anthropic():
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(503, "AI not configured — add ANTHROPIC_API_KEY to Render environment variables")
+    try:
+        import anthropic
+        return anthropic.Anthropic(api_key=api_key)
+    except ImportError:
+        raise HTTPException(503, "Anthropic package not installed")
+
+class AIChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+    context: Optional[str] = Field(default=None, max_length=4000)
+
+class AIThumbnailRequest(BaseModel):
+    frames: List[str]  # base64 JPEG strings
+    title: Optional[str] = None
+
+@app.post("/api/ai/chat")
+async def ai_chat(data: AIChatRequest, email: str = Depends(verify_token)):
+    client = _get_anthropic()
+    system = (
+        "You are an AI assistant built into the admin dashboard of a professional photography "
+        "portfolio website for Alla Al Shami, based in Dubai, UAE. "
+        "Help with: writing portfolio descriptions, SEO titles/descriptions, bio/about text, "
+        "testimonial replies, content ideas, social media captions, and technical guidance. "
+        "Be concise, creative, and professional. Tone: modern, cinematic, premium."
+    )
+    if data.context:
+        system += f"\n\nCurrent context: {data.context}"
+    def _call():
+        return client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            system=system,
+            messages=[{"role": "user", "content": data.message}]
+        )
+    try:
+        response = await asyncio.to_thread(_call)
+        return {"response": response.content[0].text}
+    except Exception as e:
+        raise HTTPException(500, f"AI error: {str(e)}")
+
+@app.post("/api/ai/best-thumbnail")
+async def ai_best_thumbnail(data: AIThumbnailRequest, email: str = Depends(verify_token)):
+    if not data.frames:
+        raise HTTPException(400, "No frames provided")
+    client = _get_anthropic()
+    content = [{
+        "type": "text",
+        "text": (
+            f"You are a professional creative director. I'm showing you {len(data.frames)} frames "
+            f"from a video{f' titled \"{data.title}\"' if data.title else ''}. "
+            "Pick the BEST thumbnail for a premium videography portfolio website. "
+            "Consider: composition, lighting, visual impact, face expressions (if any), and cinematic quality. "
+            "Reply with ONLY: the frame number (1-based) followed by a comma and a short reason under 15 words. "
+            "Example: '3, Strong composition with dramatic lighting and clear subject focus'"
+        )
+    }]
+    for i, frame_b64 in enumerate(data.frames[:6]):
+        content.append({"type": "text", "text": f"Frame {i + 1}:"})
+        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": frame_b64}})
+
+    def _call():
+        return client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=80,
+            messages=[{"role": "user", "content": content}]
+        )
+    try:
+        response = await asyncio.to_thread(_call)
+        text = response.content[0].text.strip()
+        import re
+        match = re.search(r'\b([1-6])\b', text)
+        best = int(match.group(1)) - 1 if match else 0
+        reason = text.split(',', 1)[1].strip() if ',' in text else text
+        return {"best_frame": best, "reason": reason}
+    except Exception as e:
+        raise HTTPException(500, f"AI error: {str(e)}")
+
+# ==================== REVIEW PORTAL ====================
+
+class ReviewSessionCreate(BaseModel):
+    portfolio_id: int
+    client_name: Optional[str] = Field(default=None, max_length=120)
+    expires_days: Optional[int] = Field(default=30, ge=0, le=365)
+
+class ReviewCommentCreate(BaseModel):
+    timestamp_sec: float = Field(ge=0)
+    text: str = Field(min_length=1, max_length=3000)
+    author: Optional[str] = Field(default="Client", max_length=120)
+
+@app.post("/api/review-sessions")
+def create_review_session(data: ReviewSessionCreate, db: Session = Depends(get_db), email: str = Depends(verify_token)):
+    import secrets
+    item = db.query(Portfolio).filter(Portfolio.id == data.portfolio_id).first()
+    if not item: raise HTTPException(400, "Portfolio item does not exist")
+    token = secrets.token_urlsafe(16)
+    expires = datetime.utcnow() + timedelta(days=data.expires_days or 30)
+    session = ReviewSession(token=token, portfolio_id=data.portfolio_id, client_name=data.client_name, expires_at=expires)
+    db.add(session); db.commit(); db.refresh(session)
+    return {"token": token, "id": session.id, "expires_at": expires}
+
+@app.get("/api/review-sessions")
+def list_review_sessions(db: Session = Depends(get_db), email: str = Depends(verify_token)):
+    sessions = db.query(ReviewSession).order_by(ReviewSession.created_at.desc()).all()
+    result = []
+    for s in sessions:
+        comments = db.query(ReviewComment).filter(ReviewComment.session_id == s.id).all()
+        result.append({"id": s.id, "token": s.token, "portfolio_id": s.portfolio_id,
+                        "client_name": s.client_name, "created_at": s.created_at,
+                        "expires_at": s.expires_at, "comment_count": len(comments)})
+    return result
+
+@app.delete("/api/review-sessions/{session_id}")
+def delete_review_session(session_id: int, db: Session = Depends(get_db), email: str = Depends(verify_token)):
+    db.query(ReviewComment).filter(ReviewComment.session_id == session_id).delete()
+    db.query(ReviewSession).filter(ReviewSession.id == session_id).delete()
+    db.commit(); return {"ok": True}
+
+@app.get("/api/review/{token}")
+def get_review(token: str, db: Session = Depends(get_db)):
+    s = db.query(ReviewSession).filter(ReviewSession.token == token).first()
+    if not s: raise HTTPException(404, "Review link not found")
+    if s.expires_at and s.expires_at < datetime.utcnow(): raise HTTPException(410, "Review link expired")
+    item = db.query(Portfolio).filter(Portfolio.id == s.portfolio_id).first()
+    if not item: raise HTTPException(404, "Video not found")
+    comments = db.query(ReviewComment).filter(ReviewComment.session_id == s.id).order_by(ReviewComment.timestamp_sec).all()
+    return {"session": {"id": s.id, "client_name": s.client_name, "expires_at": s.expires_at},
+            "portfolio": {"id": item.id, "title": item.title, "description": item.description,
+                          "video_url": item.video_url, "video_type": item.video_type,
+                          "thumbnail_url": item.thumbnail_url, "aspect_ratio": item.aspect_ratio,
+                          "embed_code": item.embed_code},
+            "comments": [{"id": c.id, "timestamp_sec": c.timestamp_sec, "text": c.text,
+                           "author": c.author, "resolved": c.resolved, "created_at": c.created_at} for c in comments]}
+
+@app.post("/api/review/{token}/comments")
+def add_review_comment(token: str, data: ReviewCommentCreate, request: Request, db: Session = Depends(get_db)):
+    _rate_limit(request, "review_comment")
+    s = db.query(ReviewSession).filter(ReviewSession.token == token).first()
+    if not s: raise HTTPException(404, "Review link not found")
+    if s.expires_at and s.expires_at < datetime.utcnow(): raise HTTPException(410, "Link expired")
+    c = ReviewComment(session_id=s.id, timestamp_sec=data.timestamp_sec, text=data.text, author=data.author or "Client")
+    db.add(c); db.commit(); db.refresh(c)
+    _create_notification(db, "review", f"New comment from {c.author}", f'"{data.text}" at {int(data.timestamp_sec)}s')
+    return {"id": c.id, "timestamp_sec": c.timestamp_sec, "text": c.text, "author": c.author, "resolved": c.resolved, "created_at": c.created_at}
+
+@app.put("/api/review/comments/{comment_id}/resolve")
+def resolve_comment(comment_id: int, db: Session = Depends(get_db), email: str = Depends(verify_token)):
+    c = db.query(ReviewComment).filter(ReviewComment.id == comment_id).first()
+    if not c: raise HTTPException(404)
+    c.resolved = not c.resolved; db.commit()
+    return {"resolved": c.resolved}
+
+@app.get("/api/review-sessions/{session_id}/comments")
+def get_session_comments(session_id: int, db: Session = Depends(get_db), email: str = Depends(verify_token)):
+    comments = db.query(ReviewComment).filter(ReviewComment.session_id == session_id).order_by(ReviewComment.timestamp_sec).all()
+    return [{"id": c.id, "timestamp_sec": c.timestamp_sec, "text": c.text, "author": c.author,
+             "resolved": c.resolved, "created_at": c.created_at} for c in comments]
+
+# ==================== INQUIRY SOURCE ====================
+
+@app.get("/api/analytics/sources")
+def get_inquiry_sources(db: Session = Depends(get_db), email: str = Depends(verify_token)):
+    from sqlalchemy import func
+    contact_sources = db.query(ContactSubmission.source, func.count(ContactSubmission.id)).group_by(ContactSubmission.source).all()
+    utm_sources = db.query(Visit.utm_source, func.count(Visit.id)).filter(Visit.utm_source != None).group_by(Visit.utm_source).all()
+    return {"contact_sources": [{"source": s or "Direct", "count": c} for s, c in contact_sources],
+            "utm_sources": [{"source": s, "count": c} for s, c in utm_sources]}
+
+# ==================== CLIENT DELIVERIES ====================
+
+class DeliveryFile(BaseModel):
+    name: str = Field(min_length=1, max_length=180)
+    url: str = Field(min_length=1, max_length=2000)
+    size_mb: Optional[float] = None
+    note: Optional[str] = Field(default=None, max_length=500)
+
+class DeliveryCreate(BaseModel):
+    client_name: str = Field(min_length=1, max_length=120)
+    project_title: str = Field(min_length=1, max_length=180)
+    message: Optional[str] = Field(default=None, max_length=3000)
+    files: List[DeliveryFile] = []
+    password: Optional[str] = Field(default=None, max_length=256)
+    expires_days: Optional[int] = Field(default=30, ge=0, le=365)
+
+@app.post("/api/deliveries")
+def create_delivery(data: DeliveryCreate, db: Session = Depends(get_db), email: str = Depends(verify_token)):
+    import secrets, json
+    token = secrets.token_urlsafe(16)
+    expires = datetime.utcnow() + timedelta(days=data.expires_days) if data.expires_days else None
+    delivery = ClientDelivery(
+        token=token,
+        client_name=data.client_name,
+        project_title=data.project_title,
+        message=data.message,
+        files=json.dumps([f.dict() for f in data.files]),
+        password=_prepare_optional_secret(data.password),
+        expires_at=expires,
+    )
+    db.add(delivery); db.commit(); db.refresh(delivery)
+    return {"id": delivery.id, "token": token, "expires_at": expires}
+
+@app.get("/api/deliveries")
+def list_deliveries(db: Session = Depends(get_db), email: str = Depends(verify_token)):
+    import json
+    items = db.query(ClientDelivery).order_by(ClientDelivery.created_at.desc()).all()
+    return [{
+        "id": d.id, "token": d.token, "client_name": d.client_name, "project_title": d.project_title,
+        "message": d.message, "files": json.loads(d.files or '[]'),
+        "has_password": bool(d.password), "expires_at": d.expires_at,
+        "download_count": d.download_count, "last_accessed": d.last_accessed,
+        "created_at": d.created_at,
+    } for d in items]
+
+@app.put("/api/deliveries/{delivery_id}")
+def update_delivery(delivery_id: int, data: DeliveryCreate, db: Session = Depends(get_db), email: str = Depends(verify_token)):
+    import json
+    d = db.query(ClientDelivery).filter(ClientDelivery.id == delivery_id).first()
+    if not d: raise HTTPException(404, "Not found")
+    d.client_name = data.client_name
+    d.project_title = data.project_title
+    d.message = data.message
+    d.files = json.dumps([f.dict() for f in data.files])
+    if data.password:
+        d.password = _prepare_optional_secret(data.password)
+    if data.expires_days is not None:
+        d.expires_at = datetime.utcnow() + timedelta(days=data.expires_days) if data.expires_days else None
+    db.commit()
+    return {"ok": True}
+
+@app.delete("/api/deliveries/{delivery_id}")
+def delete_delivery(delivery_id: int, db: Session = Depends(get_db), email: str = Depends(verify_token)):
+    db.query(ClientDelivery).filter(ClientDelivery.id == delivery_id).delete()
+    db.commit(); return {"ok": True}
+
+class DeliveryAccess(BaseModel):
+    password: Optional[str] = Field(default=None, max_length=256)
+
+@app.post("/api/delivery/{token}/access")
+def access_delivery(token: str, body: DeliveryAccess, request: Request, db: Session = Depends(get_db)):
+    _rate_limit(request, "delivery")
+    import json
+    d = db.query(ClientDelivery).filter(ClientDelivery.token == token).first()
+    if not d: raise HTTPException(404, "Delivery not found")
+    if d.expires_at and d.expires_at < datetime.utcnow(): raise HTTPException(410, "This delivery link has expired")
+    provided_password = body.password or ""
+    if d.password and not _verify_secret(provided_password, d.password):
+        return {"locked": True, "client_name": d.client_name, "project_title": d.project_title}
+    if d.password and provided_password and not _is_bcrypt_hash(d.password):
+        d.password = _hash_secret(provided_password)
+    d.last_accessed = datetime.utcnow(); db.commit()
+    return {
+        "locked": False,
+        "client_name": d.client_name,
+        "project_title": d.project_title,
+        "message": d.message,
+        "files": json.loads(d.files or '[]'),
+        "expires_at": d.expires_at,
+        "download_count": d.download_count,
+    }
+
+@app.post("/api/delivery/{token}/track")
+def track_download(token: str, request: Request, db: Session = Depends(get_db)):
+    _rate_limit(request, "delivery")
+    d = db.query(ClientDelivery).filter(ClientDelivery.token == token).first()
+    if not d: raise HTTPException(404)
+    if d.expires_at and d.expires_at < datetime.utcnow(): raise HTTPException(410, "This delivery link has expired")
+    d.download_count = (d.download_count or 0) + 1
+    db.commit(); return {"count": d.download_count}
+
+# ==================== HEALTH CHECK ====================
+
+@app.get("/api/health")
+def health_check():
+    """Health check endpoint"""
+    return {"status": "ok", "timestamp": datetime.utcnow()}
+
+# ==================== TRANSLATE ====================
+
+class TranslateRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+    target: str = "en"  # "en" or "ar"
+
+@app.post("/api/translate")
+async def translate_text(data: TranslateRequest, request: Request):
+    _rate_limit(request, "translate")
+    if not data.text or not data.text.strip():
+        raise HTTPException(400, "No text provided")
+    if len(data.text) > 2000:
+        raise HTTPException(400, "Text too long (max 2000 chars)")
+    if data.target not in {"en", "ar"}:
+        raise HTTPException(400, "Unsupported target language")
+    cache_key = (data.target, data.text.strip())
+    if cache_key in _translate_cache:
+        return {"translation": _translate_cache[cache_key]}
+    client = _get_anthropic()
+    target_lang = "English" if data.target == "en" else "Arabic"
+    msg = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=600,
+        messages=[{
+            "role": "user",
+            "content": f"Translate the following text to {target_lang}. Return only the translation, no explanation, no quotes:\n\n{data.text.strip()}"
+        }]
+    )
+    translation = msg.content[0].text.strip()
+    if len(_translate_cache) > 500:
+        _translate_cache.clear()
+    _translate_cache[cache_key] = translation
+    return {"translation": translation}
+
+# ==================== ROOT ====================
+
+@app.get("/")
+def root():
+    """Root endpoint"""
+    return {
+        "message": "Alla Al Shami Portfolio API",
+        "docs": "/docs",
+        "openapi": "/openapi.json"
+    }
+
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

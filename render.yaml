@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: allaportfolio-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SITE_TITLE
+        value: Alla Al Shami
+      - key: SITE_DESCRIPTION
+        value: Professional Photographer based in Dubai, UAE
+      - key: EXTRA_ORIGINS
+        sync: false
+      - key: CLOUDINARY_FOLDER
+        value: alla-portfolio
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
