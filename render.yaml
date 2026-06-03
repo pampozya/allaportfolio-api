@@ -13,7 +13,7 @@ services:
       - key: ADMIN_PASSWORD
         sync: false
       - key: SITE_TITLE
-        value: Alla Al Shami
+        value: Alaa El Shami
       - key: SITE_DESCRIPTION
         value: Professional Photographer based in Dubai, UAE
       - key: EXTRA_ORIGINS

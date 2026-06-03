@@ -1,5 +1,5 @@
 """
-Alla Al Shami Portfolio - FastAPI Backend
+Alaa El Shami Portfolio - FastAPI Backend
 Full-stack portfolio management system with admin dashboard
 """
 
@@ -52,7 +52,7 @@ _translate_cache = {}
 
 # Create FastAPI app
 app = FastAPI(
-    title="Alla Al Shami Portfolio API",
+    title="Alaa El Shami Portfolio API",
     description="Portfolio management system with admin dashboard",
     version="1.0.0"
 )
@@ -67,7 +67,7 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:3000",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    "https://allaportfolio.lensmania.ae",
+    "https://portfolio.alaaelshami.com",
 ]
 # Add the production / future custom domain via EXTRA_ORIGINS (comma-separated) when migrating.
 extra = os.getenv("EXTRA_ORIGINS", "")
@@ -165,7 +165,7 @@ class Settings(Base):
     __tablename__ = "settings"
     
     id = Column(Integer, primary_key=True, index=True)
-    site_title = Column(String, default="Alla Al Shami")
+    site_title = Column(String, default="Alaa El Shami")
     site_description = Column(Text)
     email = Column(String)
     phone = Column(String, nullable=True)
@@ -372,7 +372,7 @@ def _seed_admin():
     db = SessionLocal()
     try:
         if not db.query(User).first():
-            admin_email = os.getenv("ADMIN_EMAIL", "admin@allaportfolio.lensmania.ae")
+            admin_email = os.getenv("ADMIN_EMAIL", "admin@portfolio.alaaelshami.com")
             admin_password = os.getenv("ADMIN_PASSWORD", "change-this-password")
             db.add(User(email=admin_email, password_hash=_hash_secret(admin_password)))
             db.commit()
@@ -898,7 +898,7 @@ def get_settings(db: Session = Depends(get_db)):
     settings = db.query(Settings).first()
     if not settings:
         settings = Settings(
-            site_title=os.getenv("SITE_TITLE", "Alla Al Shami"),
+            site_title=os.getenv("SITE_TITLE", "Alaa El Shami"),
             site_description=os.getenv("SITE_DESCRIPTION", "Professional Photographer based in Dubai, UAE"),
             email=os.getenv("CONTACT_EMAIL", os.getenv("ADMIN_EMAIL", ""))
         )
@@ -1129,7 +1129,7 @@ async def _send_visit_email(ip: str, country: str, city: str, ua: str, ts: datet
     msg["To"] = to
     msg["Subject"] = f"New Portfolio Visit — {city or 'Unknown'}, {country or 'Unknown'}"
     body = (
-        f"New visitor on allaportfolio.lensmania.ae\n\n"
+        f"New visitor on portfolio.alaaelshami.com\n\n"
         f"Time:     {ts.strftime('%Y-%m-%d %H:%M UTC')}\n"
         f"Location: {city or 'Unknown'}, {country or 'Unknown'}\n"
         f"IP:       {ip}\n"
@@ -1644,7 +1644,7 @@ async def ai_chat(data: AIChatRequest, email: str = Depends(verify_token)):
     client = _get_anthropic()
     system = (
         "You are an AI assistant built into the admin dashboard of a professional photography "
-        "portfolio website for Alla Al Shami, based in Dubai, UAE. "
+        "portfolio website for Alaa El Shami, based in Dubai, UAE. "
         "Help with: writing portfolio descriptions, SEO titles/descriptions, bio/about text, "
         "testimonial replies, content ideas, social media captions, and technical guidance. "
         "Be concise, creative, and professional. Tone: modern, cinematic, premium."
@@ -1939,7 +1939,7 @@ async def translate_text(data: TranslateRequest, request: Request):
 def root():
     """Root endpoint"""
     return {
-        "message": "Alla Al Shami Portfolio API",
+        "message": "Alaa El Shami Portfolio API",
         "docs": "/docs",
         "openapi": "/openapi.json"
     }
