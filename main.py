@@ -27,6 +27,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
 import io
+import shutil
 
 # Load environment variables
 load_dotenv()
@@ -976,7 +977,7 @@ def _google_drive_credentials_info():
 
     raise RuntimeError("Google Drive credentials are not configured")
 
-def _google_drive_upload(file_bytes: bytes, filename: str, content_type: str):
+def _google_drive_upload(stream, filename: str, content_type: str):
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaIoBaseUpload
@@ -987,7 +988,8 @@ def _google_drive_upload(file_bytes: bytes, filename: str, content_type: str):
         scopes=GOOGLE_DRIVE_SCOPES,
     )
     service = build("drive", "v3", credentials=credentials, cache_discovery=False)
-    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=content_type, resumable=True)
+    stream.seek(0)
+    media = MediaIoBaseUpload(stream, mimetype=content_type, chunksize=10 * 1024 * 1024, resumable=True)
     metadata = {"name": filename, "parents": [folder_id]}
 
     created = service.files().create(
@@ -1038,7 +1040,11 @@ def get_upload_signature(email: str = Depends(verify_token)):
         "signature": signature,
     }
 
-def _cloudinary_upload(file_bytes: bytes, resource_type: str = "auto"):
+# Cloudinary's plain upload API rejects payloads over 100MB; bigger files must go
+# through the chunked upload_large API.
+CLOUDINARY_LARGE_THRESHOLD = 90 * 1024 * 1024
+
+def _cloudinary_upload(stream, size: int, resource_type: str = "auto"):
     import cloudinary
     import cloudinary.uploader
     cloudinary.config(
@@ -1047,15 +1053,20 @@ def _cloudinary_upload(file_bytes: bytes, resource_type: str = "auto"):
         api_secret=os.getenv("CLOUDINARY_API_SECRET"),
         secure=True
     )
-    result = cloudinary.uploader.upload(
-        io.BytesIO(file_bytes),
+    stream.seek(0)
+    options = dict(
         resource_type=resource_type,
         folder=os.getenv("CLOUDINARY_FOLDER", "alla-portfolio"),
         public_id=str(uuid.uuid4()),
-        chunk_size=6000000,
-        timeout=120
+        timeout=600,
     )
+    if size > CLOUDINARY_LARGE_THRESHOLD:
+        result = cloudinary.uploader.upload_large(stream, chunk_size=20_000_000, **options)
+    else:
+        result = cloudinary.uploader.upload(stream, **options)
     return result["secure_url"]
+
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "500"))
 
 @app.post("/api/upload")
 async def upload_file(
@@ -1075,9 +1086,20 @@ async def upload_file(
             allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
             raise HTTPException(status_code=400, detail=f"File type '{ext}' not allowed. Allowed types: {allowed}")
 
-        file_bytes = await file.read()
-        if not file_bytes:
+        # Work with the spooled temp file directly — reading the whole upload into
+        # memory OOM-kills the worker on large videos (512MB instance).
+        stream = file.file
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        stream.seek(0)
+        if size == 0:
             raise HTTPException(status_code=400, detail="File is empty")
+        if size > MAX_UPLOAD_MB * 1024 * 1024:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File is {size / (1024 * 1024):.0f} MB — the maximum is {MAX_UPLOAD_MB} MB. "
+                       f"Export a compressed version or raise MAX_UPLOAD_MB.",
+            )
 
         requested_provider = (request.query_params.get("provider") or "").lower()
         wants_google_drive = requested_provider in {"gdrive", "google", "google-drive"}
@@ -1085,7 +1107,7 @@ async def upload_file(
         if _google_drive_configured():
             try:
                 content_type = file.content_type or "application/octet-stream"
-                return await asyncio.to_thread(_google_drive_upload, file_bytes, file.filename, content_type)
+                return await asyncio.to_thread(_google_drive_upload, stream, file.filename, content_type)
             except Exception as e:
                 error_msg = str(e)
                 print(f"[Google Drive error] {error_msg}")
@@ -1102,7 +1124,7 @@ async def upload_file(
             is_video = ext in {'.mp4', '.mov', '.avi', '.mkv', '.webm'}
             resource_type = "video" if is_video else "image"
             try:
-                url = await asyncio.to_thread(_cloudinary_upload, file_bytes, resource_type)
+                url = await asyncio.to_thread(_cloudinary_upload, stream, size, resource_type)
                 return {"url": url, "filename": file.filename}
             except Exception as e:
                 error_msg = str(e)
@@ -1114,7 +1136,7 @@ async def upload_file(
         dest = UPLOAD_DIR / filename
         dest.parent.mkdir(parents=True, exist_ok=True)
         with dest.open("wb") as buf:
-            buf.write(file_bytes)
+            shutil.copyfileobj(stream, buf)
         return {"url": f"/uploads/{filename}", "filename": filename}
 
     except HTTPException:
@@ -1504,6 +1526,13 @@ async def _send_contact_email(data: ContactRequest):
 
 # ==================== NOTIFICATIONS ====================
 
+def _create_notification(db: Session, type: str, title: str, body: Optional[str] = None):
+    try:
+        db.add(Notification(type=type, title=title, body=body))
+        db.commit()
+    except Exception:
+        db.rollback()
+
 @app.get("/api/notifications", response_model=List[NotificationResponse])
 def get_notifications(email: str = Depends(verify_token), db: Session = Depends(get_db)):
     return db.query(Notification).order_by(Notification.created_at.desc()).limit(50).all()
@@ -1688,11 +1717,12 @@ async def ai_best_thumbnail(data: AIThumbnailRequest, email: str = Depends(verif
     if not data.frames:
         raise HTTPException(400, "No frames provided")
     client = _get_anthropic()
+    titled = f' titled "{data.title}"' if data.title else ''
     content = [{
         "type": "text",
         "text": (
             f"You are a professional creative director. I'm showing you {len(data.frames)} frames "
-            f"from a video{f' titled \"{data.title}\"' if data.title else ''}. "
+            f"from a video{titled}. "
             "Pick the BEST thumbnail for a premium videography portfolio website. "
             "Consider: composition, lighting, visual impact, face expressions (if any), and cinematic quality. "
             "Reply with ONLY: the frame number (1-based) followed by a comma and a short reason under 15 words. "
