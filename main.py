@@ -453,6 +453,21 @@ class PortfolioUpdate(BaseModel):
     seo_title: Optional[str] = None
     seo_description: Optional[str] = None
 
+def _cdn_optimize(url: Optional[str], is_video: bool = False) -> Optional[str]:
+    """Insert Cloudinary delivery optimizations (auto quality/format) into a stored URL.
+
+    Raw HQ uploads are served at full bitrate otherwise, which makes playback slow.
+    Idempotent, and leaves non-Cloudinary URLs (YouTube, Drive, local) untouched.
+    """
+    if not url or "res.cloudinary.com" not in url or "q_auto" in url:
+        return url
+    marker = "/video/upload/" if is_video else "/image/upload/"
+    if marker not in url:
+        return url
+    prefix, rest = url.split(marker, 1)
+    transformation = "q_auto" if is_video else "f_auto,q_auto"
+    return f"{prefix}{marker}{transformation}/{rest}"
+
 class PortfolioResponse(BaseModel):
     id: int
     category_id: int
@@ -496,6 +511,16 @@ class PortfolioResponse(BaseModel):
     @classmethod
     def default_featured(cls, value):
         return False if value is None else value
+
+    @field_validator("video_url", mode="before")
+    @classmethod
+    def optimize_video_url(cls, value):
+        return _cdn_optimize(value, is_video=True)
+
+    @field_validator("thumbnail_url", mode="before")
+    @classmethod
+    def optimize_thumbnail_url(cls, value):
+        return _cdn_optimize(value)
 
     class Config:
         from_attributes = True
@@ -591,6 +616,11 @@ class SettingsResponse(BaseModel):
     @classmethod
     def default_booking_flags(cls, value):
         return True if value is None else value
+
+    @field_validator("showreel_url", mode="before")
+    @classmethod
+    def optimize_showreel_url(cls, value):
+        return _cdn_optimize(value, is_video=True)
 
     class Config:
         from_attributes = True
@@ -1060,11 +1090,16 @@ def _cloudinary_upload(stream, size: int, resource_type: str = "auto"):
         public_id=str(uuid.uuid4()),
         timeout=600,
     )
+    if resource_type == "video":
+        # Pre-generate the q_auto derivative in the background so the first
+        # playback doesn't wait on an on-the-fly transcode of the HQ original.
+        options["eager"] = [{"quality": "auto"}]
+        options["eager_async"] = True
     if size > CLOUDINARY_LARGE_THRESHOLD:
         result = cloudinary.uploader.upload_large(stream, chunk_size=20_000_000, **options)
     else:
         result = cloudinary.uploader.upload(stream, **options)
-    return result["secure_url"]
+    return _cdn_optimize(result["secure_url"], is_video=(resource_type == "video"))
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "500"))
 
@@ -1800,8 +1835,8 @@ def get_review(token: str, db: Session = Depends(get_db)):
     comments = db.query(ReviewComment).filter(ReviewComment.session_id == s.id).order_by(ReviewComment.timestamp_sec).all()
     return {"session": {"id": s.id, "client_name": s.client_name, "expires_at": s.expires_at},
             "portfolio": {"id": item.id, "title": item.title, "description": item.description,
-                          "video_url": item.video_url, "video_type": item.video_type,
-                          "thumbnail_url": item.thumbnail_url, "aspect_ratio": item.aspect_ratio,
+                          "video_url": _cdn_optimize(item.video_url, is_video=True), "video_type": item.video_type,
+                          "thumbnail_url": _cdn_optimize(item.thumbnail_url), "aspect_ratio": item.aspect_ratio,
                           "embed_code": item.embed_code},
             "comments": [{"id": c.id, "timestamp_sec": c.timestamp_sec, "text": c.text,
                            "author": c.author, "resolved": c.resolved, "created_at": c.created_at} for c in comments]}
